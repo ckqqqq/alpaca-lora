@@ -31,7 +31,8 @@ def train(
     data_path: str = "yahma/alpaca-cleaned",
     output_dir: str = "./lora-alpaca",
     # training hyperparams
-    batch_size: int = 128,
+    # batch_size: int = 128,
+    accumulation_steps: int =4,
     micro_batch_size: int = 4,
     num_epochs: int = 3,
     learning_rate: float = 3e-4,
@@ -41,6 +42,7 @@ def train(
     lora_r: int = 8,
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
+    # 这里 
     lora_target_modules: List[str] = [
         "q_proj",
         "v_proj",
@@ -50,12 +52,13 @@ def train(
     add_eos_token: bool = False,
     group_by_length: bool = False,  # faster, but produces an odd training loss curve
     # wandb params
-    wandb_project: str = "",
+    wandb_project: str = "llama-lora",
     wandb_run_name: str = "",
     wandb_watch: str = "",  # options: false | gradients | all
     wandb_log_model: str = "",  # options: false | true
     resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
     prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
+    deepspeed_path:str="/home/ckq/CHATGPT/alpaca-lora/config/deepspeed.yaml",
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -63,7 +66,8 @@ def train(
             f"base_model: {base_model}\n"
             f"data_path: {data_path}\n"
             f"output_dir: {output_dir}\n"
-            f"batch_size: {batch_size}\n"
+            # f"batch_size: {batch_size}\n"
+            f"gradient_accumulation_steps_per_gpu: {accumulation_steps} \n"
             f"micro_batch_size: {micro_batch_size}\n"
             f"num_epochs: {num_epochs}\n"
             f"learning_rate: {learning_rate}\n"
@@ -80,13 +84,14 @@ def train(
             f"wandb_run_name: {wandb_run_name}\n"
             f"wandb_watch: {wandb_watch}\n"
             f"wandb_log_model: {wandb_log_model}\n"
-            f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
+            f"resume_from_checkpoint: {resume_from_checkpoint or False} ***************** \n"
             f"prompt template: {prompt_template_name}\n"
+            f"deepspeed: {deepspeed_path}\n"
         )
     assert (
         base_model
     ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
-    gradient_accumulation_steps = batch_size // micro_batch_size
+    # gradient_accumulation_steps = batch_size // micro_batch_size
 
     prompter = Prompter(prompt_template_name)
 
@@ -94,8 +99,9 @@ def train(
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
     if ddp:
+        print("ddp",accumulation_steps)
         device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
-        gradient_accumulation_steps = gradient_accumulation_steps // world_size
+        # accumulation_steps = accumulation_steps // world_size
 
     # Check if parameter passed or if set within environ
     use_wandb = len(wandb_project) > 0 or (
@@ -188,7 +194,8 @@ def train(
     else:
         data = load_dataset(data_path)
 
-    if resume_from_checkpoint:
+    if resume_from_checkpoint and resume_from_checkpoint!=None:
+        print("resuming")
         # Check the available weights and load them
         checkpoint_name = os.path.join(
             resume_from_checkpoint, "pytorch_model.bin"
@@ -223,19 +230,19 @@ def train(
     else:
         train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
         val_data = None
-
+    print(f"ddp {ddp} ",f"cuda {torch.cuda.device_count()}" )
     if not ddp and torch.cuda.device_count() > 1:
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
         model.is_parallelizable = True
         model.model_parallel = True
-
+    print(accumulation_steps)
     trainer = transformers.Trainer(
         model=model,
         train_dataset=train_data,
         eval_dataset=val_data,
         args=transformers.TrainingArguments(
             per_device_train_batch_size=micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_accumulation_steps=accumulation_steps,
             warmup_steps=100,
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
@@ -244,8 +251,8 @@ def train(
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
-            eval_steps=200 if val_set_size > 0 else None,
-            save_steps=200,
+            eval_steps=50 if val_set_size > 0 else None,
+            save_steps=100,
             output_dir=output_dir,
             save_total_limit=3,
             load_best_model_at_end=True if val_set_size > 0 else False,
@@ -253,6 +260,7 @@ def train(
             group_by_length=group_by_length,
             report_to="wandb" if use_wandb else None,
             run_name=wandb_run_name if use_wandb else None,
+            deepspeed=deepspeed_path if deepspeed_path else None
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
@@ -269,9 +277,11 @@ def train(
 
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
-
-    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-
+        # pytroch 2 太牛了
+    if resume_from_checkpoint and resume_from_checkpoint!=None:
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    else:    
+        trainer.train()
     model.save_pretrained(output_dir)
 
     print(
